@@ -10,13 +10,13 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import time
 from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from isaaclab.sim import SimulationContext
 from isaaclab.sim.utils.stage import get_current_stage, get_current_stage_id
 
 from .xr_cfg import XrAnchorRotationMode
@@ -25,6 +25,28 @@ with contextlib.suppress(ModuleNotFoundError):
     import usdrt
     from pxr import Gf as pxrGf
     from usdrt import Rt
+
+
+def smoothing_alpha(wall_dt: float, smoothing_time: float) -> float:
+    """Slerp fraction that advances an exponential smoother by one frame.
+
+    :attr:`~isaaclab_teleop.xr_cfg.XrCfg.anchor_rotation_smoothing_time` is
+    documented as a wall-clock time constant, so the fraction must be derived
+    from the wall-clock time between smoothing steps: a fixed per-frame
+    fraction turns the time constant into a frame count, and the smoother
+    then lags in proportion to how slowly the app happens to be running.
+
+    Args:
+        wall_dt: Wall-clock seconds since the previous smoothing step.
+            Clamped to [0, 1]: a stall contributes at most one second of
+            smoothing progress, and a backwards clock contributes none.
+        smoothing_time: Time constant [s] of the smoother.
+
+    Returns:
+        Fraction in [0, 1] of the remaining rotation error to remove.
+    """
+    dt = min(max(wall_dt, 0.0), 1.0)
+    return min(1.0, 1.0 - math.exp(-dt / max(smoothing_time, 1e-6)))
 
 
 class XrAnchorSynchronizer:
@@ -38,6 +60,7 @@ class XrAnchorSynchronizer:
         self.__anchor_prim_initial_quat = None
         self.__anchor_prim_initial_height = None
         self.__smoothed_anchor_quat = None
+        self.__last_smoothing_time: float | None = None
         self.__last_anchor_quat = None
         self.__anchor_rotation_enabled = True
 
@@ -62,6 +85,7 @@ class XrAnchorSynchronizer:
         self.__anchor_prim_initial_quat = None
         self.__anchor_prim_initial_height = None
         self.__smoothed_anchor_quat = None
+        self.__last_smoothing_time = None
         self.__last_anchor_quat = None
         self.__anchor_rotation_enabled = True
         self.__cached_world_pos = None
@@ -166,12 +190,13 @@ class XrAnchorSynchronizer:
                     pxr_anchor_quat = pxr_delta_yaw_only_quat * pxr_cfg_quat
 
                     if self._xr_cfg.anchor_rotation_mode == XrAnchorRotationMode.FOLLOW_PRIM_SMOOTHED:
-                        if self.__smoothed_anchor_quat is None:
+                        now = time.perf_counter()
+                        last = self.__last_smoothing_time
+                        self.__last_smoothing_time = now
+                        if self.__smoothed_anchor_quat is None or last is None:
                             self.__smoothed_anchor_quat = pxr_anchor_quat
                         else:
-                            dt = SimulationContext.instance().get_rendering_dt()
-                            alpha = 1.0 - math.exp(-dt / max(self._xr_cfg.anchor_rotation_smoothing_time, 1e-6))
-                            alpha = min(1.0, max(0.05, alpha))
+                            alpha = smoothing_alpha(now - last, self._xr_cfg.anchor_rotation_smoothing_time)
                             self.__smoothed_anchor_quat = pxrGf.Slerp(
                                 alpha, self.__smoothed_anchor_quat, pxr_anchor_quat
                             )
